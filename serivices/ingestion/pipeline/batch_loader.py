@@ -63,8 +63,7 @@ class BatchLoader:
     
     @staticmethod
     def iter_rows(path: Path) -> Iterator[dict]:
-        """Yield one dict per record. Lines that cannot be parsed are yielded as
-        {"__unparseable__": ...} so they fail schema validation and reach the dead-letter."""
+       
         suffix = path.suffix.lower()
 
         if suffix == ".csv":
@@ -95,9 +94,8 @@ class BatchLoader:
         else:
             raise ValueError(f"unsupported file type: {suffix!r} (use .csv, .jsonl, .ndjson, .json)")
 
-       async def load_file(self, path: str | Path, source: Optional[str] = None) -> BatchReport:
-        """Load a whole file chunk by chunk. File reads run in a worker thread so the
-        event loop (and NATS heartbeats) stay responsive."""
+    async def load_file(self, path: str | Path, source: Optional[str] = None) -> BatchReport:
+       
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -114,4 +112,34 @@ class BatchLoader:
                      path.name, report.total, report.published, report.schema_rejected)
         return report
 
+    async def process_rows(self, rows: list[dict], source: str) -> BatchReport:
+        started = time.monotonic()
+        report = BatchReport(total=len(rows))
+ 
+   
+        valid, rejects = validate_batch(rows, self.model, source)
+        report.schema_rejected = len(rejects)
+ 
 
+        kept = []
+        for rec in valid:
+            out = self._apply_stages(rec, source)
+            if out is None:
+                report.stage_dropped += 1
+            else:
+                kept.append(out)
+ 
+        if kept:
+            result = await self.publisher.publish_batch(kept)
+            report.published = result.published
+            report.duplicates = result.duplicates
+            report.publish_failed = len(result.failed)
+            if result.failed:
+                self._spill(result.failed, source)
+ 
+        await self._dead_letter(rejects, report)
+ 
+        report.duration_s = time.monotonic() - started
+        return report
+
+    
