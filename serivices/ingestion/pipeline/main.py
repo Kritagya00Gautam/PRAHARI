@@ -176,4 +176,21 @@ async def run_live(cfg: AppConfig) -> int:
         log.info("final publisher stats: %s", publisher.stats)
     return 0
  
-
+async def run_backfill(cfg: AppConfig, paths: list[Path]) -> int:
+    total = BatchReport()
+    async with IngestionStreamPublisher(cfg.publisher) as publisher:
+        loader = BatchLoader(publisher, stages=build_stages(),
+                             chunk_size=cfg.batch_size, failed_log=cfg.failed_log)
+        for path in paths:
+            try:
+                report = await loader.load_file(path)
+            except (FileNotFoundError, ValueError) as exc:
+                log.error("skipping %s: %s", path, exc)
+                total.publish_failed += 1
+                continue
+            log.info("%s done: %s", path.name, report.summary())
+            total.merge(report)
+ 
+    log.info("backfill complete: %s", total.summary())
+    return 0 if total.clean else 1
+ 
