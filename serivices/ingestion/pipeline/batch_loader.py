@@ -45,5 +45,73 @@ class BatchReport:
             f"dlq_failed={self.dlq_failed} in {self.duration_s:.2f}s"
         )
 
+class BatchLoader:
+    def __init__(
+        self,
+        publisher: IngestionStreamPublisher,
+        stages: Sequence[Stage] = (),
+        model: Type[Any] = TelemetryData,
+        chunk_size: int = 500,
+        failed_log: Optional[Path] = None,
+    ):
+        self.publisher = publisher
+        self.stages = list(stages)
+        self.model = model
+        self.chunk_size = chunk_size
+        self.failed_log = Path(failed_log) if failed_log else None
+
+    
+    @staticmethod
+    def iter_rows(path: Path) -> Iterator[dict]:
+        """Yield one dict per record. Lines that cannot be parsed are yielded as
+        {"__unparseable__": ...} so they fail schema validation and reach the dead-letter."""
+        suffix = path.suffix.lower()
+
+        if suffix == ".csv":
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    # Empty cells become None; extra columns (key None) are ignored.
+                    yield {k: (v if v != "" else None) for k, v in row.items() if k is not None}
+
+        elif suffix in (".jsonl", ".ndjson"):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        yield {UNPARSEABLE_KEY: line[:200]}
+                        continue
+                    yield obj if isinstance(obj, dict) else {UNPARSEABLE_KEY: line[:200]}
+
+        elif suffix == ".json":
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            for obj in (data if isinstance(data, list) else [data]):
+                yield obj if isinstance(obj, dict) else {UNPARSEABLE_KEY: str(obj)[:200]}
+
+        else:
+            raise ValueError(f"unsupported file type: {suffix!r} (use .csv, .jsonl, .ndjson, .json)")
+
+       async def load_file(self, path: str | Path, source: Optional[str] = None) -> BatchReport:
+        """Load a whole file chunk by chunk. File reads run in a worker thread so the
+        event loop (and NATS heartbeats) stay responsive."""
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        source = source or re.sub(r"[^A-Za-z0-9_-]", "_", path.stem)[:64] or "batch"
+
+        report = BatchReport()
+        chunks = self.iter_chunks(path)
+        while True:
+            chunk = await asyncio.to_thread(next, chunks, None)
+            if chunk is None:
+                break
+            report.merge(await self.process_rows(chunk, source))
+            log.info("%s: %d rows processed (published=%d rejected=%d)",
+                     path.name, report.total, report.published, report.schema_rejected)
+        return report
 
 
