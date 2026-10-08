@@ -142,4 +142,45 @@ class BatchLoader:
         report.duration_s = time.monotonic() - started
         return report
 
+    def _apply_stages(self, rec: TelemetryData, source: str) -> Optional[TelemetryData]:
+        for stage in self.stages:
+            try:
+                rec = stage(rec)
+            except Exception:
+                # A buggy stage must not take down the pipeline; the record is dropped.
+                log.exception("stage %s raised for a record from %s; dropping it",
+                              getattr(stage, "__name__", stage), source)
+                return None
+            if rec is None:
+                return None
+        return rec
+ 
+    async def _dead_letter(self, rejects: list[Reject], report: BatchReport) -> None:
+        if not rejects:
+            return
+ 
+        async def send(rej: Reject) -> None:
+            raw = json.dumps(rej.raw, default=str).encode("utf-8")
+            reason = "; ".join(f"{e.path}: {e.message}" for e in rej.errors) or "unknown"
+            await self.publisher.publish_dead_letter(rej.source, raw, reason)
+ 
+        outcomes = await asyncio.gather(*(send(r) for r in rejects), return_exceptions=True)
+        for out in outcomes:
+            if isinstance(out, Exception):
+                report.dlq_failed += 1
+                log.error("dead-letter publish failed: %s", out)
+            else:
+                report.dead_lettered += 1
+
+    def _spill(self, failed: list[tuple[Any, str]], source: str) -> None:
+        """Records that could not be published are written locally so they can be replayed
+        with `main.py backfill <failed_log>`."""
+        if self.failed_log is None:
+            log.error("%d records from %s failed to publish and no failed_log is set",
+                      len(failed), source)
+            return
+        with open(self.failed_log, "a", encoding="utf-8") as f:
+            for rec, _reason in failed:
+                f.write(json.dumps(rec.model_dump(mode="json")) + "\n")
+        log.warning("spilled %d unpublished records to %s", len(failed), self.failed_log)
     
