@@ -28,3 +28,22 @@ class BatchReport:
     dead_lettered: int = 0
     dlq_failed: int = 0
     duration_s: float = 0.0
+
+    def merge(self, other: "BatchReport") -> None:
+        for f in fields(self):
+            setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
+
+    @property
+    def clean(self) -> bool:
+        return self.publish_failed == 0 and self.dlq_failed == 0
+
+    def summary(self) -> str:
+        return (
+            f"total={self.total} published={self.published} duplicates={self.duplicates} "
+            f"schema_rejected={self.schema_rejected} stage_dropped={self.stage_dropped} "
+            f"publish_failed={self.publish_failed} dead_lettered={self.dead_lettered} "
+            f"dlq_failed={self.dlq_failed} in {self.duration_s:.2f}s"
+        )
+
+
+
