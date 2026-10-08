@@ -77,3 +77,103 @@ def observation_to_payload(obs: Observation) -> dict:
         if obs.location.elevation_m is not None:
             payload.setdefault("elevation_m", obs.location.elevation_m)
     return payload
+
+async def _run_connector(factory: ConnectorFactory, queue: asyncio.Queue, stop: asyncio.Event) -> None:
+    """Supervisor: run one connector, restart it with backoff if it crashes."""
+    loop = asyncio.get_running_loop()
+    backoff = 1.0
+    while not stop.is_set():
+        conn = factory()
+        name = conn.config.name
+        started = loop.time()
+        try:
+            async with conn:
+                async for obs in conn.stream():
+                    await queue.put((name, observation_to_payload(obs)))
+            return  # stream ended normally
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("connector %s crashed; restarting in %.0fs", name, backoff)
+        if loop.time() - started > 60:
+            backoff = 1.0  # it ran for a while, so treat the next failure as fresh
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60.0)
+ 
+async def _collect(queue: asyncio.Queue, max_items: int, max_wait_s: float) -> list:
+    """Gather up to max_items, waiting at most max_wait_s in total."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_wait_s
+    items: list = []
+    while len(items) < max_items:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            items.append(await asyncio.wait_for(queue.get(), timeout=remaining))
+        except asyncio.TimeoutError:
+            break
+    return items
+
+async def _consume(queue: asyncio.Queue, loader: BatchLoader, cfg: AppConfig, stop: asyncio.Event) -> None:
+    """Turn the stream of (source, payload) into micro-batches and push them through the loader.
+    Keeps running until stop is set AND the queue is empty, so nothing queued is lost on shutdown."""
+    while True:
+        batch = await _collect(queue, cfg.batch_size, cfg.flush_interval_s)
+        if not batch:
+            if stop.is_set() and queue.empty():
+                return
+            continue
+ 
+        by_source: dict[str, list[dict]] = defaultdict(list)
+        for source, payload in batch:
+            by_source[source].append(payload)
+ 
+        for source, rows in by_source.items():
+            try:
+                report = await loader.process_rows(rows, source)
+                log.info("[%s] %s", source, report.summary())
+            except Exception:
+                log.exception("[%s] batch of %d rows failed unexpectedly", source, len(rows))
+
+def _install_signal_handlers(stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError, ValueError):
+            # Windows: add_signal_handler is unavailable. Fall back for Ctrl+C.
+            if sig == signal.SIGINT:
+                signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
+
+ 
+async def run_live(cfg: AppConfig) -> int:
+    factories = build_connectors()
+    if not factories:
+        log.error("No connectors registered. Edit build_connectors() in main.py.")
+        return 2
+ 
+    stop = asyncio.Event()
+    _install_signal_handlers(stop)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_max)
+ 
+    async with IngestionStreamPublisher(cfg.publisher) as publisher:
+        loader = BatchLoader(publisher, stages=build_stages(),
+                             chunk_size=cfg.batch_size, failed_log=cfg.failed_log)
+ 
+        producers = [asyncio.create_task(_run_connector(f, queue, stop), name=f"connector-{i}")
+                     for i, f in enumerate(factories)]
+        consumer = asyncio.create_task(_consume(queue, loader, cfg, stop), name="consumer")
+        log.info("live ingestion started with %d connector(s)", len(producers))
+ 
+        await stop.wait()
+        log.info("shutdown requested; stopping connectors and draining the queue")
+        for t in producers:
+            t.cancel()
+        await asyncio.gather(*producers, return_exceptions=True)
+        await consumer  # drains whatever is still queued
+ 
+        log.info("final publisher stats: %s", publisher.stats)
+    return 0
+ 
+
