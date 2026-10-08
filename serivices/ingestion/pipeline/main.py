@@ -193,4 +193,33 @@ async def run_backfill(cfg: AppConfig, paths: list[Path]) -> int:
  
     log.info("backfill complete: %s", total.summary())
     return 0 if total.clean else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="ingestion", description="Prahari ingestion service")
+    sub = parser.add_subparsers(dest="mode", required=True)
  
+    sub.add_parser("live", help="run all connectors and stream to NATS")
+    bf = sub.add_parser("backfill", help="load historical files (.csv .jsonl .ndjson .json)")
+    bf.add_argument("files", nargs="+", type=Path)
+    bf.add_argument("--chunk-size", type=int, help="rows per batch (default from BATCH_SIZE)")
+ 
+    args = parser.parse_args(argv)
+    cfg = AppConfig.from_env()
+    if getattr(args, "chunk_size", None):
+        cfg.batch_size = args.chunk_size
+ 
+    logging.basicConfig(level=cfg.log_level,
+                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+ 
+    try:
+        if args.mode == "live":
+            return asyncio.run(run_live(cfg))
+        return asyncio.run(run_backfill(cfg, args.files))
+    except KeyboardInterrupt:
+        log.warning("interrupted")
+        return 130
+ 
+ 
+if __name__ == "__main__":
+    sys.exit(main())
