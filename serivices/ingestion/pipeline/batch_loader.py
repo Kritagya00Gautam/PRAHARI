@@ -17,3 +17,14 @@ log = logging.getLogger("prahari.ingestion.batch_loader")
 
 UNPARSEABLE_KEY = "__unparseable__"
 
+@dataclass
+class BatchReport:
+    total: int = 0
+    schema_rejected: int = 0
+    stage_dropped: int = 0
+    published: int = 0
+    duplicates: int = 0
+    publish_failed: int = 0
+    dead_lettered: int = 0
+    dlq_failed: int = 0
+    duration_s: float = 0.0
