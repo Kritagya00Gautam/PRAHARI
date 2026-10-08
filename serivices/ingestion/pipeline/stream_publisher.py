@@ -78,7 +78,7 @@ class IngestionStreamPublisher:
         # Override with a domain key (e.g. station_id + observed_at) if you prefer.
         self._msg_id_fn = msg_id_fn or (lambda _t, payload: hashlib.sha256(payload).hexdigest())
 
-    # ---- lifecycle ------------------------------------------------------- #
+   
 
     async def __aenter__(self) -> "IngestionStreamPublisher":
         await self.connect()
@@ -118,7 +118,7 @@ class IngestionStreamPublisher:
     async def health_check(self) -> bool:
         return self._nc is not None and self._nc.is_connected
 
-    # ---- publishing ------------------------------------------------------ #
+
 
     async def publish_telemetry(self, telemetry: TelemetryData) -> bool:
         """
