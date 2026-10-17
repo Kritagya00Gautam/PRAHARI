@@ -10,11 +10,16 @@ from enum import Enum
 from typing import Any, AsyncIterator, Optional
 
 
+# --------------------------------------------------------------------------- #
+# Data contracts
+# --------------------------------------------------------------------------- #
 
 class ObservationKind(str, Enum):
     """What kind of signal this record carries."""
     RIVER_LEVEL = "river_level"
     RAINFALL = "rainfall"
+    WEATHER = "weather"          # temperature, humidity, wind, pressure (one variable per record)
+    FORECAST = "forecast"        # a predicted value; payload carries valid_at and lead_hours
     SEISMIC = "seismic"
     SATELLITE_SCENE = "satellite_scene"
     CAMERA_FRAME = "camera_frame"
@@ -35,7 +40,12 @@ class GeoPoint:
 
 @dataclass
 class Observation:
-    
+    """
+    The single record type that leaves a connector.
+
+    Keep this in sync with packages/schemas; when that package exists, import
+    the shared type from there instead of defining it here.
+    """
     source: str                          # connector name, e.g. "dhm_river_gauge"
     kind: ObservationKind
     observed_at: datetime                # when the real-world event happened (UTC)
@@ -72,6 +82,9 @@ class ConnectorStats:
     consecutive_failures: int = 0
 
 
+# --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
 
 class ConnectorError(Exception):
     """Base class for connector failures."""
@@ -89,6 +102,9 @@ class ParseError(ConnectorError):
     """The payload was fetched but could not be understood."""
 
 
+# --------------------------------------------------------------------------- #
+# Base connector
+# --------------------------------------------------------------------------- #
 
 class BaseConnector(ABC):
     """
@@ -110,7 +126,7 @@ class BaseConnector(ABC):
         self._request_times: list[float] = []
         self._closed = False
 
-
+    # ---- methods subclasses must implement ------------------------------- #
 
     @abstractmethod
     async def fetch(self) -> Any:
@@ -122,7 +138,7 @@ class BaseConnector(ABC):
         """Convert raw data into Observation records. Raise ParseError on
         malformed input. Must not perform network calls."""
 
-
+    # ---- optional hooks -------------------------------------------------- #
 
     async def open(self) -> None:
         """Create HTTP sessions, open sockets, authenticate."""
@@ -137,7 +153,7 @@ class BaseConnector(ABC):
         age = (datetime.now(timezone.utc) - self.stats.last_success_at).total_seconds()
         return age < self.config.poll_interval_s * 3
 
-    
+    # ---- lifecycle ------------------------------------------------------- #
 
     async def __aenter__(self) -> "BaseConnector":
         self._closed = False                 # allows re-entering after a shutdown
@@ -153,7 +169,7 @@ class BaseConnector(ABC):
             self._closed = True
             await self.close()
 
-  
+    # ---- core logic ------------------------------------------------------ #
 
     async def poll_once(self) -> list[Observation]:
         """One fetch + parse cycle with retries. Returns records, or [] on failure."""
@@ -206,7 +222,7 @@ class BaseConnector(ABC):
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.0, self.config.poll_interval_s - elapsed))
 
-  
+    # ---- internals ------------------------------------------------------- #
 
     async def _fetch_with_retry(self) -> Any:
         attempt = 0

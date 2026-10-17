@@ -4,15 +4,11 @@ import csv
 import json
 import logging
 import re
-import socket
-import urllib.error
-import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 from ingestion.connectors.base import (
     BaseConnector,
@@ -22,22 +18,23 @@ from ingestion.connectors.base import (
     ObservationKind,
     ParseError,
     PermanentFetchError,
-    TransientFetchError,
+)
+from ingestion.connectors._common import (
+    dig as _dig,
+    http_get,
+    normalize_id as normalize_station_id,
+    to_float as _to_float,
+    validate_http_url,
 )
 
 log = logging.getLogger("prahari.ingestion.gauges")
 
 _UNIT_TO_M = {"m": 1.0, "cm": 0.01, "mm": 0.001, "ft": 0.3048}
-_MISSING = {"", "na", "n/a", "nan", "null", "none", "-", "--"}
-_MAX_BODY_BYTES = 5 * 1024 * 1024
 
 
-def normalize_station_id(raw: str) -> str:
-    """Make an id safe as a NATS subject token. Real station indexes contain dots (e.g. 283.5)."""
-    return re.sub(r"[^A-Za-z0-9_-]", "_", str(raw).strip())[:64]
-
-
-
+# --------------------------------------------------------------------------- #
+# Settings
+# --------------------------------------------------------------------------- #
 
 @dataclass
 class GaugeStation:
@@ -77,8 +74,7 @@ class GaugeSettings:
     emit_history_on_first_poll: bool = False  # False: first poll emits only the latest per station
 
     def __post_init__(self) -> None:
-        if urlsplit(self.url).scheme not in ("http", "https"):
-            raise ValueError("url must start with http:// or https://")
+        validate_http_url(self.url)
         if self.value_unit not in _UNIT_TO_M:
             raise ValueError(f"value_unit must be one of {sorted(_UNIT_TO_M)}")
         ZoneInfo(self.timestamp_tz)        # fails early on a bad zone name
@@ -104,15 +100,9 @@ def load_gauge_stations(path: str | Path) -> dict[str, GaugeStation]:
     return out
 
 
-
-def _dig(obj: Any, path: str) -> Any:
-    """Follow a dotted path through nested dicts. Raises KeyError if a step is missing."""
-    for part in filter(None, path.split(".")):
-        if not isinstance(obj, dict) or part not in obj:
-            raise KeyError(part)
-        obj = obj[part]
-    return obj
-
+# --------------------------------------------------------------------------- #
+# Small parsing helpers
+# --------------------------------------------------------------------------- #
 
 def parse_timestamp(value: Any, tz: ZoneInfo, formats: tuple[str, ...] = ()) -> datetime:
     """Epoch seconds/milliseconds, a configured strptime format, or ISO-8601 -> aware UTC datetime.
@@ -140,18 +130,9 @@ def parse_timestamp(value: Any, tz: ZoneInfo, formats: tuple[str, ...] = ()) -> 
     return dt.astimezone(timezone.utc)
 
 
-def _to_float(value: Any) -> Optional[float]:
-    """None means 'the feed has no reading' (blank, NA, null)."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "")
-    if text.lower() in _MISSING:
-        return None
-    return float(text)                     # ValueError for genuinely malformed numbers
-
-
+# --------------------------------------------------------------------------- #
+# Connector
+# --------------------------------------------------------------------------- #
 
 class GaugeConnector(BaseConnector):
     """
@@ -187,34 +168,16 @@ class GaugeConnector(BaseConnector):
         self._warned_unknown: set[str] = set()
         self.feed_stats: Counter[str] = Counter()
 
+    # ---- fetch ----------------------------------------------------------- #
 
     async def fetch(self) -> bytes:
         return await asyncio.to_thread(self._fetcher)
 
     def _http_get(self) -> bytes:
-        """Blocking GET, run in a worker thread. Maps failures to retry / don't-retry."""
         s = self.settings
-        url = s.url
-        if s.params:
-            url += ("&" if "?" in url else "?") + urlencode(s.params)
-        req = urllib.request.Request(url, headers={
-            "Accept": "application/json", "User-Agent": "prahari-ingestion/1.0", **s.headers})
-        # Log host and path only: the query string and headers may carry credentials.
-        parts = urlsplit(s.url)
-        where = f"{parts.scheme}://{parts.netloc}{parts.path}"
-        try:
-            with urllib.request.urlopen(req, timeout=s.http_timeout_s) as resp:
-                body = resp.read(_MAX_BODY_BYTES + 1)
-        except urllib.error.HTTPError as exc:
-            if exc.code in (400, 401, 403, 404, 410):
-                raise PermanentFetchError(f"HTTP {exc.code} from {where}") from exc
-            raise TransientFetchError(f"HTTP {exc.code} from {where}") from exc
-        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
-            raise TransientFetchError(f"cannot reach {where}: {getattr(exc, 'reason', exc)}") from exc
-        if len(body) > _MAX_BODY_BYTES:
-            raise PermanentFetchError(f"response from {where} exceeds {_MAX_BODY_BYTES} bytes")
-        return body
+        return http_get(s.url, headers=s.headers, params=s.params, timeout_s=s.http_timeout_s)
 
+    # ---- parse ----------------------------------------------------------- #
 
     def parse(self, raw: bytes) -> list[Observation]:
         s, fm = self.settings, self.settings.field_map
@@ -245,7 +208,8 @@ class GaugeConnector(BaseConnector):
             if obs is not None:
                 candidates.append(obs)
 
-       
+        # Rows that are well-formed but carry no usable value ("NA", unknown station) are normal.
+        # Every row being malformed is not: the feed layout has probably changed.
         if rows and self.feed_stats["rows_malformed"] - malformed_before == len(rows):
             raise ParseError(f"none of {len(rows)} rows could be read; has the feed format changed?")
 
