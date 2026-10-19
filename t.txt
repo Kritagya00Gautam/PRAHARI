@@ -1,5 +1,5 @@
 dhm river ko api key
 
 git add .
-git commit -m "CAMERA STREAM COMPLETED"
+git commit -m "ingestion COMPLETED"
 git push origin main
